@@ -7,7 +7,9 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 
 use crate::app::review_test_support::{Outcome, click, draw, file_app, folder_app, press, reopen};
 use crate::app::{App, Focus, Mode, Open};
+use crate::delivery::Discard;
 use crate::doc::Document;
+use crate::overlay;
 use crate::store::{Location, Store};
 use crate::tree::Tree;
 
@@ -291,4 +293,119 @@ fn a_folder_opens_expands_and_reloads_when_one_annotated_file_is_unreadable() {
     assert_eq!(opened.status.as_deref(), Some("skipped 1 unreadable file(s): b.md"));
     assert!(!opened.folder_counts.contains_key(&blocked));
     std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+// ----- diff overlay: the UI reflects what the agent changed since the last round ----
+
+#[test]
+fn annotating_a_file_captures_its_baseline() {
+    let (root, mut app, _) = file_app("baseline-capture");
+    app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
+    let record = app.open.store.location_record().expect("persisted store");
+    let baseline = overlay::read(record).expect("baseline written with the first annotation");
+    assert_eq!(baseline, "# Plan\n\none\n\ntwo\n\nthree\n");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn reopening_an_agent_edited_file_shows_the_overlay() {
+    let (root, mut app, _) = file_app("overlay-open");
+    app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
+
+    // The agent applies feedback: one line rewritten, one added.
+    let Provenance::File { path } = &app.open.source.provenance else { return };
+    std::fs::write(path, "# Plan\n\nONE (rewritten)\n\ntwo\n\nthree\n\nfour (added)\n").expect("agent edit");
+    reopen(&mut app);
+
+    let overlay = app.open.overlay.as_ref().expect("the edit shows as an overlay");
+    assert_eq!(overlay.added_lines, 3, "rewritten line + added line + its newline");
+    assert_eq!(overlay.removed_lines, 1, "'one' was replaced");
+    assert!(overlay.is_added(app.open.doc.source.find("ONE (rewritten)").expect("present")));
+    assert!(overlay.is_added(app.open.doc.source.find("four (added)").expect("present")));
+    let rewritten = app.open.doc.source.find("ONE (rewritten)").expect("present");
+    assert!(overlay.is_removed(rewritten), "the line standing where 'one' was carries the removal mark");
+    assert!(overlay.baseline.contains("\none\n"), "the baseline is the reviewed version");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn accepting_changes_updates_the_baseline_and_clears_the_marks() {
+    let (root, mut app, _) = file_app("overlay-accept");
+    app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
+
+    let Provenance::File { path } = &app.open.source.provenance else { return };
+    let path = path.clone();
+    std::fs::write(&path, "# Plan\n\none changed\n\ntwo\n\nthree\n").expect("agent edit");
+    reopen(&mut app);
+    assert!(app.open.overlay.is_some());
+
+    press(&mut app, 'a');
+    assert!(app.open.overlay.is_none(), "the diff UI disappears");
+    let record = app.open.store.location_record().expect("persisted store");
+    let baseline = overlay::read(record).expect("baseline");
+    assert_eq!(baseline, "# Plan\n\none changed\n\ntwo\n\nthree\n");
+
+    // A second reopen with no further edits stays clean.
+    reopen(&mut app);
+    assert!(app.open.overlay.is_none());
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn reverting_puts_the_reviewed_version_back_on_disk() {
+    let (root, mut app, _) = file_app("overlay-revert");
+    app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
+
+    let Provenance::File { path } = &app.open.source.provenance else { return };
+    let path = path.clone();
+    std::fs::write(&path, "# Plan\n\none\n\ntwo rewritten\n\nthree\n").expect("agent edit");
+    reopen(&mut app);
+    assert!(app.open.overlay.is_some());
+
+    press(&mut app, 'D');
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("reverted"),
+        "# Plan\n\none\n\ntwo\n\nthree\n",
+        "the file is back to the reviewed version"
+    );
+    assert!(app.open.overlay.is_none(), "baseline and file agree again");
+    // The round-1 annotation re-anchored cleanly against the restored content.
+    assert_eq!(app.open.store.orphans(), 0);
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn comments_on_changed_lines_do_not_move_the_baseline() {
+    let (root, mut app, _) = file_app("overlay-comment");
+    app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
+
+    let Provenance::File { path } = &app.open.source.provenance else { return };
+    std::fs::write(path, "# Plan\n\none changed\n\ntwo\n\nthree\n").expect("agent edit");
+    reopen(&mut app);
+    let baseline_before =
+        overlay::read(app.open.store.location_record().expect("record")).expect("baseline").clone();
+
+    // Comment on the changed line while the overlay is up.
+    app.add_quote_annotation("one changed", Kind::Comment, "round 2 note".into()).expect("annotate");
+    let baseline_after = overlay::read(app.open.store.location_record().expect("record")).expect("baseline");
+    assert_eq!(baseline_before, baseline_after, "the baseline still names the reviewed version");
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn a_diff_review_has_no_overlay_of_its_own() {
+    // The .patch review is already a diff; it must not try to diff against itself.
+    let dir = std::env::temp_dir().join(format!("plannotator-overlay-diff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("f.patch");
+    std::fs::write(&path, "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b\n").expect("patch");
+    let app = App::open(
+        DocumentSource::diff(path, "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        100,
+        Box::new(Discard),
+    )
+    .expect("opens");
+    assert!(app.open.overlay.is_none());
+    std::fs::remove_dir_all(dir).expect("cleanup");
 }

@@ -11,6 +11,7 @@ mod export;
 mod herdr;
 mod last;
 mod layout;
+mod overlay;
 mod srcmap;
 mod store;
 mod tree;

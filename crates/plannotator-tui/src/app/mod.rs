@@ -28,6 +28,7 @@ use ratatui::layout::Rect;
 use crate::delivery::Delivery;
 use crate::doc::Document;
 use crate::layout::DocLayout;
+use crate::overlay;
 use crate::store::{Location, Store};
 use crate::tree::Tree;
 use crate::workspace_paths;
@@ -106,6 +107,9 @@ struct Open {
     doc: Document,
     layout: DocLayout,
     store: Store,
+    /// Changes since the version the annotations were first written against; `None`
+    /// for transient documents, fresh files, and files unchanged since review.
+    overlay: Option<overlay::Overlay>,
 }
 
 impl Open {
@@ -121,7 +125,20 @@ impl Open {
             }
             _ => Store::transient(),
         };
-        Ok(Self { source, doc, layout, store })
+        let overlay = Self::diff_overlay(&source, &store);
+        Ok(Self { source, doc, layout, store, overlay })
+    }
+
+    /// The reviewed version comes from the baseline sidecar written when the round's
+    /// first annotation was saved. Transient documents (diffs, agent messages) have no
+    /// baseline: their reviews are single-round by design.
+    fn diff_overlay(source: &DocumentSource, store: &Store) -> Option<overlay::Overlay> {
+        if source.transient {
+            return None;
+        }
+        let record = store.location_record()?;
+        let baseline = overlay::read(record)?;
+        overlay::Overlay::between(&baseline, &source.content)
     }
 }
 
@@ -359,8 +376,58 @@ impl App {
     fn annotate(&mut self, range: Range<usize>, kind: Kind, body: String) -> Result<()> {
         let rendered = self.open.layout.rendered_in_range(&self.open.doc.source, &range);
         self.open.store.add(&self.open.doc, range, rendered, kind, body)?;
+        self.capture_baseline();
         self.mark_unsent();
         self.sync_tree_counts();
+        Ok(())
+    }
+
+    /// Persist the content under review so a later open can show what the agent changed
+    /// since this round. Best-effort: a failed baseline write degrades to "no diff
+    /// overlay" and must never fail the annotation itself. Skipped while a diff is
+    /// active — comments on the changes must not clobber the version they diff against.
+    fn capture_baseline(&mut self) {
+        if self.open.overlay.is_some()
+            || self.open.source.transient
+            || !matches!(self.open.source.provenance, Provenance::File { .. })
+        {
+            return;
+        }
+        if let Some(record) = self.open.store.location_record() {
+            let _ = overlay::write(record, &self.open.doc.source);
+        }
+    }
+
+    /// `a`: the changes are fine. The baseline moves up to the current content, and the
+    /// marks disappear — the diff UI disappears, as the review closes itself.
+    fn accept_changes(&mut self) -> Result<()> {
+        if self.open.overlay.is_none() {
+            self.status = Some("nothing to accept: the file matches your last review".into());
+            return Ok(());
+        }
+        if let Some(record) = self.open.store.location_record() {
+            overlay::write(record, &self.open.doc.source)?;
+        }
+        self.open.overlay = None;
+        self.status = Some("changes accepted · baseline updated".into());
+        Ok(())
+    }
+
+    /// `D`: put the file back to the version under review and re-read it. Annotations
+    /// were made against exactly that content, so they re-anchor cleanly.
+    fn revert_changes(&mut self) -> Result<()> {
+        let Some(overlay) = &self.open.overlay else {
+            self.status = Some("nothing to revert: the file matches your last review".into());
+            return Ok(());
+        };
+        let Provenance::File { path } = &self.open.source.provenance else {
+            return Ok(());
+        };
+        let path = path.clone();
+        let baseline = overlay.baseline.clone();
+        std::fs::write(&path, baseline).with_context(|| format!("reverting {}", path.display()))?;
+        self.reload()?;
+        self.status = Some("reverted to the version you reviewed".into());
         Ok(())
     }
 
@@ -487,6 +554,7 @@ impl App {
         self.open.layout = DocLayout::build(&self.open.doc, self.open.layout.width);
         self.open.store =
             Store::load(&Location::for_file(&self.data_dir, &self.project, &path), &self.open.doc)?;
+        self.open.overlay = Open::diff_overlay(&self.open.source, &self.open.store);
         self.refresh_review_counts();
         self.derive_send_state();
         self.sync_tree_counts();

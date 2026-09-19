@@ -296,6 +296,11 @@ impl Store {
         self.annotations.len()
     }
 
+    /// The record path behind a persisted store; `None` for transient stores.
+    pub(crate) fn location_record(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub(crate) fn orphans(&self) -> usize {
         self.resolved.iter().filter(|r| **r == Resolution::Orphan).count()
     }

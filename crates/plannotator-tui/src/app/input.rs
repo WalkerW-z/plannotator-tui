@@ -169,6 +169,12 @@ impl App {
             self.visual_key(key);
             return Ok(());
         }
+        // Diff review verbs: only when no selection is pending, so the toolbar keeps `a`.
+        match (key.code, self.open.overlay.is_some()) {
+            (KeyCode::Char('a'), true) => return self.accept_changes(),
+            (KeyCode::Char('D'), true) => return self.revert_changes(),
+            _ => {}
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
                 if self.pending.is_some() || self.selection.is_some() {

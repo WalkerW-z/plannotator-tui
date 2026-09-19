@@ -204,10 +204,28 @@ impl App {
                 buf.set_style(Rect { x, y: screen_y, width: 1, height: 1 }, Style::new().bg(CURSOR_BG));
             }
 
+            // Diff overlay: green for content the agent added, red where baseline
+            // content was removed. Only rows carrying source cells can show a change.
+            let diff_mark = self.open.overlay.as_ref().and_then(|overlay| {
+                row.cells.iter().flatten().find_map(|offset| {
+                    let offset = *offset;
+                    if overlay.is_added(offset) {
+                        Some((Color::Green, "added"))
+                    } else if overlay.is_removed(offset) {
+                        Some((Color::Red, "removed"))
+                    } else {
+                        None
+                    }
+                })
+            });
+
             let marker = match (block == self.selected, row_has_annotation) {
                 (true, _) => Span::styled("▍", Style::new().fg(Color::Cyan)),
                 (false, true) => Span::styled("▍", Style::new().fg(Color::Yellow)),
-                (false, false) => Span::raw(" "),
+                (false, false) => match diff_mark {
+                    Some((color, _)) => Span::styled("▍", Style::new().fg(color)),
+                    None => Span::raw(" "),
+                },
             };
             buf.set_span(gutter.x, screen_y, &marker, 1);
         }
@@ -394,6 +412,12 @@ impl App {
         // The status leads: it is the transient half of the line, and the name and counters
         // it pushes right are on screen for the whole session anyway.
         let mut parts: Vec<String> = self.status.iter().cloned().collect();
+        if let Some(overlay) = &self.open.overlay {
+            parts.push(format!(
+                "+{} −{} changed since your review",
+                overlay.added_lines, overlay.removed_lines
+            ));
+        }
         parts.extend([
             self.open.source.name.clone(),
             format!(
@@ -416,6 +440,9 @@ impl App {
             _ if self.pending.is_some() => "a looks good · c comment · d delete · esc clear ",
             Focus::Tree => "j/k · enter open · E send · t hide · q quit ",
             Focus::Rail => "j/k · e edit · x remove · tab · q quit ",
+            Focus::Document if self.open.overlay.is_some() => {
+                "c comment · a accept · D revert · i changes · E send · q quit "
+            }
             Focus::Document => "drag or v select · c comment · E send · tab · q quit ",
         };
         // The status must stay readable at any width, so the key help yields columns to it

@@ -25,6 +25,7 @@ use crate::layout::DocLayout;
 
 const USAGE: &str = "usage:
   plannotator-tui <file.md | folder>
+  plannotator-tui <change.patch>            # review a unified diff
   plannotator-tui --export <file.md>
   plannotator-tui --bench <file.md>
   plannotator-tui --blocks <file.md>
@@ -46,7 +47,17 @@ fn doc_width(cols: u16) -> usize {
 
 fn open_file(path: &PathBuf) -> Result<DocumentSource> {
     let content = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(DocumentSource::file(path.clone(), content))
+    if is_patch(path) {
+        Ok(DocumentSource::diff(path.clone(), content))
+    } else {
+        Ok(DocumentSource::file(path.clone(), content))
+    }
+}
+
+/// A unified diff opens as a diff review, not a markdown document. `git diff >
+/// fix.patch` and `git format-patch` output both land here.
+fn is_patch(path: &Path) -> bool {
+    matches!(path.extension().and_then(|e| e.to_str()), Some("patch" | "diff"))
 }
 
 /// A file opens on its own; a folder opens in folder mode on its first markdown file.

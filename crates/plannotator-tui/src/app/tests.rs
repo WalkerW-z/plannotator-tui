@@ -437,3 +437,45 @@ fn pasting_into_the_comment_box_keeps_newlines() {
     let placed = app.open.store.placed();
     assert_eq!(placed.last().expect("annotation").annotation.body, "pasted one\npasted two");
 }
+
+// ----- diff reviews --------------------------------------------------------------
+
+const PATCH: &str = "diff --git a/src/auth.rs b/src/auth.rs\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -1,2 +1,2 @@\n-old token\n+new token\n";
+
+/// A diff review over a real `.patch` file in a fresh temp dir.
+fn diff_app(delivery: Box<dyn Delivery>) -> App {
+    let dir = std::env::temp_dir().join(format!("plannotator-tui-diff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("patch dir");
+    let path = dir.join("fix.patch");
+    std::fs::write(&path, PATCH).expect("write patch");
+    let mut app = App::open(DocumentSource::diff(path, PATCH.to_owned()), 60, delivery).expect("diff opens");
+    app.data_dir = scratch_data_dir();
+    app
+}
+
+#[test]
+fn a_diff_review_sends_feedback_quoting_patch_lines() {
+    let mut app = diff_app(Box::new(Discard));
+    app.add_quote_annotation("new token", Kind::Comment, "why now?".to_owned()).expect("annotate");
+    let text = app.feedback();
+    assert!(text.contains("# Annotations on fix.patch"), "{text}");
+    assert!(text.contains("(line 6)"), "the quote anchors to its patch line: {text}");
+    assert!(text.contains("Comment on: \"new token\""), "{text}");
+    assert!(text.contains("> why now?"), "{text}");
+    app.send_feedback().expect("send");
+    assert_eq!(app.send_state, SendState::Sent);
+}
+
+#[test]
+fn a_diff_review_persists_nothing_and_reloads_never() {
+    let mut app = diff_app(Box::new(Discard));
+    app.add_block_annotation(1, Kind::LooksGood, "nice".to_owned()).expect("annotate");
+    assert!(!app.data_dir.join("clients").exists(), "a transient diff writes nothing under the data dir");
+    app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Char('r')))).expect("reload");
+    assert!(
+        app.status.as_deref().is_some_and(|s| s.contains("snapshot")),
+        "reload explains itself on a diff: {:?}",
+        app.status
+    );
+}

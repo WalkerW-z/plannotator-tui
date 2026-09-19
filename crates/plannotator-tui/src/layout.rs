@@ -7,7 +7,7 @@
 use std::ops::Range;
 
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use tui_markdown::{Options, StyleSheet};
 
 use crate::doc::{BlockKind, Document};
@@ -65,6 +65,10 @@ pub(crate) struct DocLayout {
 }
 
 fn render_block(doc: &Document, index: usize) -> (Text<'static>, Vec<LineOffsets>) {
+    let kind = doc.blocks.get(index).map_or(BlockKind::Other, |b| b.kind);
+    if kind.is_diff() {
+        return render_diff_block(doc, index, kind);
+    }
     let source = doc.block_text(index);
     let text = own(tui_markdown::from_str_with_options(source, &Options::new(Styles)));
     let plain: Vec<String> = text.lines.iter().map(ToString::to_string).collect();
@@ -73,13 +77,45 @@ fn render_block(doc: &Document, index: usize) -> (Text<'static>, Vec<LineOffsets
     (text, offsets)
 }
 
+/// House palette for diff lines: foreground color only, keeping backgrounds free for
+/// selection and annotation highlighting.
+fn diff_line_style(line: &str, kind: BlockKind) -> Style {
+    match kind {
+        BlockKind::DiffFileHeader => Style::new().fg(Color::DarkGray),
+        _ => match line.chars().next() {
+            Some('+') => Style::new().fg(Color::Green),
+            Some('-') => Style::new().fg(Color::Red),
+            Some('@') => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Some('\\') => Style::new().fg(Color::DarkGray),
+            _ => Style::new(),
+        },
+    }
+}
+
+/// Render a diff block: verbatim lines, one per source line, styled by prefix. The
+/// offset map is the identity — every rendered character indexes its own source byte —
+/// so selection and annotations land exactly where the eye puts them.
+fn render_diff_block(doc: &Document, index: usize, kind: BlockKind) -> (Text<'static>, Vec<LineOffsets>) {
+    let source = doc.block_text(index);
+    let base = doc.blocks.get(index).map_or(0, |b| b.range.start);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut offsets: Vec<LineOffsets> = Vec::new();
+    let mut line_start = 0usize;
+    for raw in source.split('\n') {
+        let style = diff_line_style(raw, kind);
+        lines.push(Line::from(vec![Span::styled(raw.to_owned(), style)]));
+        offsets.push(raw.char_indices().map(|(bi, _)| Some(base + line_start + bi)).collect());
+        line_start += raw.len() + 1;
+    }
+    (Text::from(lines), offsets)
+}
+
 fn own(text: Text<'_>) -> Text<'static> {
     let lines = text
         .lines
         .into_iter()
         .map(|line| {
-            let spans =
-                line.spans.into_iter().map(|s| ratatui::text::Span::styled(s.content.into_owned(), s.style));
+            let spans = line.spans.into_iter().map(|s| Span::styled(s.content.into_owned(), s.style));
             Line::from(spans.collect::<Vec<_>>()).style(line.style)
         })
         .collect::<Vec<_>>();
@@ -190,5 +226,49 @@ mod tests {
         let bold = doc.source.find("**login").expect("present");
         let bold_range = bold..bold + "**login page**".len();
         assert_eq!(layout.rendered_in_range(&doc.source, &bold_range), "login page");
+    }
+
+    #[test]
+    fn diff_lines_render_verbatim_in_prefix_colors() {
+        let patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-old\n+new\n";
+        let doc = Document::parse_diff(patch.to_owned());
+        let layout = DocLayout::build(&doc, 80);
+        let header = layout.blocks.first().expect("header");
+        let hunk = layout.blocks.get(1).expect("hunk");
+        assert_eq!(
+            header.rows.iter().map(|r| r.line.to_string()).collect::<Vec<_>>(),
+            ["diff --git a/f b/f", "--- a/f", "+++ b/f"]
+        );
+        assert!(header.rows.iter().all(|r| r.line.spans.iter().all(|s| s.style.fg == Some(Color::DarkGray))));
+        assert_eq!(
+            hunk.rows.iter().map(|r| r.line.to_string()).collect::<Vec<_>>(),
+            ["@@ -1,2 +1,2 @@", "-old", "+new"]
+        );
+        let colors: Vec<_> =
+            hunk.rows.iter().map(|r| r.line.spans.first().and_then(|s| s.style.fg)).collect();
+        assert_eq!(colors, [Some(Color::Cyan), Some(Color::Red), Some(Color::Green)]);
+    }
+
+    #[test]
+    fn diff_offsets_map_every_character_to_its_own_source_byte() {
+        let patch = "@@ -1 +1 @@\n-old\n+new\n";
+        let doc = Document::parse_diff(patch.to_owned());
+        let layout = DocLayout::build(&doc, 80);
+        let hunk = layout.blocks.first().expect("hunk");
+        // Row 1 is "-old": its first rendered char is the '-' at its source position.
+        let row = hunk.rows.get(1).expect("removed row");
+        let dash = patch.find("-old").expect("present") as u32;
+        assert_eq!(row.cells.first().copied().flatten().map(|b| b as u32), Some(dash));
+        assert_eq!(row.cells.get(1).copied().flatten().map(|b| b as u32), Some(dash + 1));
+    }
+
+    #[test]
+    fn diff_lines_clip_instead_of_wrap() {
+        let long = "+".repeat(200);
+        let patch = format!("@@ -1 +1 @@\n{long}\n");
+        let doc = Document::parse_diff(patch);
+        let layout = DocLayout::build(&doc, 80);
+        let hunk = layout.blocks.first().expect("hunk");
+        assert_eq!(hunk.rows.len(), 2); // header + one clipped body row
     }
 }

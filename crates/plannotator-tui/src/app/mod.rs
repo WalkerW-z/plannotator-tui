@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use plannotator_tui_schema::{DocumentSource, Kind, Provenance};
+use plannotator_tui_schema::{DocumentSource, Kind, Provenance, SourceFormat};
 use ratatui::layout::Rect;
 
 use crate::delivery::Delivery;
@@ -110,7 +110,10 @@ struct Open {
 
 impl Open {
     fn new(source: DocumentSource, width: usize, data_dir: &Path, project: &str) -> Result<Self> {
-        let doc = Document::parse(source.content.clone());
+        let doc = match source.format {
+            SourceFormat::Markdown => Document::parse(source.content.clone()),
+            SourceFormat::Diff => Document::parse_diff(source.content.clone()),
+        };
         let layout = DocLayout::build(&doc, width);
         let store = match (&source.provenance, source.transient) {
             (Provenance::File { path }, false) => {
@@ -468,6 +471,12 @@ impl App {
 
     /// Re-read the document from its provenance and re-resolve every annotation.
     fn reload(&mut self) -> Result<()> {
+        if self.open.source.format == SourceFormat::Diff {
+            // A diff is a snapshot of one agent edit; a regenerated patch reopens as a
+            // new review instead of silently re-anchoring old comments.
+            self.status = Some("a diff is a snapshot; open the new patch to review it".into());
+            return Ok(());
+        }
         let Provenance::File { path } = &self.open.source.provenance else {
             self.status = Some("not a file; nothing to reload".into());
             return Ok(());

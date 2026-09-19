@@ -146,6 +146,12 @@ use self::compose::Compose;
 
 pub(crate) struct App {
     open: Open,
+    /// The file review behind the changes view. `Some` only while the changes view is
+    /// on screen; the md review inside is untouched, so swapping back restores it.
+    changes_open: Option<Open>,
+    /// `+added −removed` of the stashed review, for the footer chip while the changes
+    /// view (whose own Open has no overlay) is showing.
+    changes_counts: Option<(usize, usize)>,
     /// Where annotations are stored and how this folder is named there.
     data_dir: PathBuf,
     project: String,
@@ -257,6 +263,8 @@ impl App {
             pick_open: 0,
             pick_return: 0,
             pick_cache: HashMap::new(),
+            changes_open: None,
+            changes_counts: None,
             message_host: String::new(),
             message_transcript: String::new(),
             message_session: None,
@@ -293,7 +301,8 @@ impl App {
         // The project is the folder's, not the first file's parent's.
         app.project = workspace_paths::project_name(root);
         if let Some(path) = &first {
-            app.open = Open::new(read_file(path)?, width, &app.data_dir, &app.project)?;
+            let open = Open::new(read_file(path)?, width, &app.data_dir, &app.project)?;
+            app.set_open(open);
         }
         app.refresh_counts(&mut tree);
         app.tree_cursor = first.as_deref().and_then(|p| tree.position(p)).unwrap_or(0);
@@ -350,7 +359,8 @@ impl App {
             return Ok(());
         }
         let width = self.open.layout.width;
-        self.open = Open::new(read_file(&path)?, width, &self.data_dir, &self.project)?;
+        let open = Open::new(read_file(&path)?, width, &self.data_dir, &self.project)?;
+        self.set_open(open);
         self.update_open_review_counts();
         self.derive_send_state();
         self.scroll = 0;
@@ -387,7 +397,8 @@ impl App {
     /// overlay" and must never fail the annotation itself. Skipped while a diff is
     /// active — comments on the changes must not clobber the version they diff against.
     fn capture_baseline(&mut self) {
-        if self.open.overlay.is_some()
+        if self.changes_open.is_some()
+            || self.open.overlay.is_some()
             || self.open.source.transient
             || !matches!(self.open.source.provenance, Provenance::File { .. })
         {
@@ -398,9 +409,96 @@ impl App {
         }
     }
 
-    /// `a`: the changes are fine. The baseline moves up to the current content, and the
-    /// marks disappear — the diff UI disappears, as the review closes itself.
+    /// The only sanctioned way to replace the open document: drops the changes-view
+    /// stash, which is valid for exactly the Open it was made from. A tree switch,
+    /// folder open, or reload that bypasses this would leave `i` restoring a foreign
+    /// document.
+    fn set_open(&mut self, open: Open) {
+        self.open = open;
+        self.changes_open = None;
+        self.changes_counts = None;
+    }
+
+    /// Whether the synthesized whole-file diff is on screen instead of the file review.
+    fn in_changes_view(&self) -> bool {
+        self.changes_open.is_some()
+    }
+
+    /// Land in the changes view when the file changed since review. Interactive single-
+    /// file opens only (called from `interactive`); headless commands and folder mode
+    /// keep the real document as `self.open`.
+    pub(crate) fn enter_changes_view_if_any(&mut self) {
+        if self.tree.is_none() && self.open.overlay.is_some() && !self.in_changes_view() {
+            let _ = self.toggle_changes_view();
+        }
+    }
+
+    /// `i`: swap the file review for the whole-file diff, or back. The stash keeps the
+    /// review intact — annotations on it live on disk, the swap is purely visual.
+    fn toggle_changes_view(&mut self) -> Result<()> {
+        if let Some(md) = self.changes_open.take() {
+            self.changes_counts = None;
+            self.open = md;
+            self.swap_open_reset();
+            self.status = Some("file review".into());
+            return Ok(());
+        }
+        let Some(overlay) = &self.open.overlay else {
+            self.status = Some("no changes yet: the file matches your last review".into());
+            return Ok(());
+        };
+        let name = self.open.source.name.clone();
+        let diff_text = overlay.full_diff.clone();
+        let counts = (overlay.added_lines, overlay.removed_lines);
+        let source = DocumentSource::new(
+            diff_text,
+            format!("{name} · changes"),
+            true,
+            Provenance::File { path: self.open_source_path().unwrap_or_default() },
+        );
+        let source = Self::as_diff_format(source);
+        let width = self.open.layout.width;
+        let changes = Open::new(source, width, &self.data_dir, &self.project)?;
+        let md = std::mem::replace(&mut self.open, changes);
+        self.changes_open = Some(md);
+        self.swap_open_reset();
+        self.changes_counts = Some(counts);
+        self.status = Some(format!("whole-file diff · +{} −{} · i back to file", counts.0, counts.1));
+        Ok(())
+    }
+
+    fn open_source_path(&self) -> Option<PathBuf> {
+        match &self.open.source.provenance {
+            Provenance::File { path } => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// `DocumentSource::new` defaults to Markdown; the changes view parses as a diff.
+    fn as_diff_format(mut source: DocumentSource) -> DocumentSource {
+        source.format = SourceFormat::Diff;
+        source
+    }
+
+    /// Reset per-document cursor state after the caller replaced `self.open`
+    /// (same reset list as the picker's `show_candidate`). Tree state is preserved —
+    /// the folder the user is in did not change.
+    fn swap_open_reset(&mut self) {
+        self.scroll = 0;
+        self.selected = 0;
+        self.cursor = (0, 0);
+        self.rail_cursor = 0;
+        self.clear_selection();
+        self.focus = Focus::Document;
+        self.derive_send_state();
+    }
+
+    /// `a`: the changes are fine. From the changes view, return to the file first —
+    /// the verbs operate on the review, never on the transient diff document.
     fn accept_changes(&mut self) -> Result<()> {
+        if self.in_changes_view() {
+            self.toggle_changes_view()?;
+        }
         if self.open.overlay.is_none() {
             self.status = Some("nothing to accept: the file matches your last review".into());
             return Ok(());
@@ -414,8 +512,12 @@ impl App {
     }
 
     /// `D`: put the file back to the version under review and re-read it. Annotations
-    /// were made against exactly that content, so they re-anchor cleanly.
+    /// were made against exactly that content, so they re-anchor cleanly. From the
+    /// changes view, return to the file first — revert is a review verb.
     fn revert_changes(&mut self) -> Result<()> {
+        if self.in_changes_view() {
+            self.toggle_changes_view()?;
+        }
         let Some(overlay) = &self.open.overlay else {
             self.status = Some("nothing to revert: the file matches your last review".into());
             return Ok(());
@@ -538,9 +640,16 @@ impl App {
 
     /// Re-read the document from its provenance and re-resolve every annotation.
     fn reload(&mut self) -> Result<()> {
+        if self.in_changes_view() {
+            // The changes view is a snapshot of one read; the file under it is what
+            // reloads. Return to it first so the re-read lands on the right document.
+            self.toggle_changes_view()?;
+        }
         if self.open.source.format == SourceFormat::Diff {
-            // A diff is a snapshot of one agent edit; a regenerated patch reopens as a
-            // new review instead of silently re-anchoring old comments.
+            // A standalone .patch file is a snapshot of one agent edit; a regenerated
+            // patch reopens as a new review instead of silently re-anchoring old
+            // comments. The changes view never reaches this line — it swapped out
+            // above and the file review it belongs to reloads normally.
             self.status = Some("a diff is a snapshot; open the new patch to review it".into());
             return Ok(());
         }
@@ -555,6 +664,9 @@ impl App {
         self.open.store =
             Store::load(&Location::for_file(&self.data_dir, &self.project, &path), &self.open.doc)?;
         self.open.overlay = Open::diff_overlay(&self.open.source, &self.open.store);
+        // The re-read file makes any stashed changes view stale by definition.
+        self.changes_open = None;
+        self.changes_counts = None;
         self.refresh_review_counts();
         self.derive_send_state();
         self.sync_tree_counts();

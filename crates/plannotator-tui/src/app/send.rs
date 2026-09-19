@@ -104,7 +104,12 @@ impl App {
             {
                 self.folder_counts.insert(path.clone(), ReviewCounts::for_store(&part.store));
             }
-            if part.path.as_deref().is_none_or(|p| self.is_open(p)) {
+            // Take the part's store back when it IS this review (single-file case, or
+            // a transient review like a .patch/changes view — there `is_open` is false
+            // by design, but the delivered ids still belong to the store on screen).
+            let own_review =
+                part.path.as_deref().is_none_or(|p| self.is_open(p) || self.open.source.transient);
+            if own_review {
                 self.open.store = part.store;
             }
         }
@@ -204,6 +209,9 @@ impl App {
         self.delivery.is_agent()
             && self.send_count() > 0
             && (self.is_file_review() || self.send_state != SendState::Sent)
+            // Comments made in the changes view live only in memory (their store is
+            // transient); quitting with them pending must ask, not drop them.
+            || (self.in_changes_view() && !self.open.store.placed().is_empty())
     }
 
     pub(super) fn request_quit(&mut self) {

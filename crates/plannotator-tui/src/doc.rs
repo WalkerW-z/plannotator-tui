@@ -29,13 +29,12 @@ pub(crate) enum BlockKind {
 }
 
 impl BlockKind {
-    /// Code and tables keep their columns; everything else word-wraps. Diff lines are
-    /// exact text: a wrapped `-` line would read as two removed lines.
+    /// Code and tables keep their columns; everything else word-wraps. Diff body lines
+    /// wrap too: they carry prose too long to clip away, and `wrap_line` carries both
+    /// style and source offsets, so colors and annotations survive the wrap. File
+    /// headers stay clipped — they are paths, not prose.
     pub(crate) fn preserves_columns(self) -> bool {
-        matches!(
-            self,
-            BlockKind::CodeBlock | BlockKind::Table | BlockKind::DiffFileHeader | BlockKind::DiffHunk
-        )
+        matches!(self, BlockKind::CodeBlock | BlockKind::Table | BlockKind::DiffFileHeader)
     }
 
     /// Rendered by the diff renderer, not by the markdown renderer.

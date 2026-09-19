@@ -153,7 +153,10 @@ impl App {
     }
 
     pub(super) fn is_open(&self, path: &Path) -> bool {
-        matches!(&self.open.source.provenance, Provenance::File { path: p } if p == path)
+        // The changes view holds a transient stand-in for the real file: it is not the
+        // open review. Sending/counting must read the real record, never the diff.
+        !self.open.source.transient
+            && matches!(&self.open.source.provenance, Provenance::File { path: p } if p == path)
     }
 
     /// Other files need source and anchor resolution, not a rendered document layout.
@@ -217,6 +220,7 @@ impl App {
 
     pub(super) fn update_open_review_counts(&mut self) {
         if self.tree.is_some()
+            && !self.open.source.transient
             && let Provenance::File { path } = &self.open.source.provenance
         {
             let mut counts = ReviewCounts::for_store(&self.open.store);

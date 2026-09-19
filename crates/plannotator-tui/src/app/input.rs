@@ -51,6 +51,9 @@ impl App {
                 self.request_quit();
                 return Ok(());
             }
+            (KeyCode::Char('i'), _) if self.open.overlay.is_some() || self.in_changes_view() => {
+                return self.toggle_changes_view();
+            }
             (KeyCode::Tab, _) => {
                 self.cycle_focus();
                 return Ok(());
@@ -170,7 +173,8 @@ impl App {
             return Ok(());
         }
         // Diff review verbs: only when no selection is pending, so the toolbar keeps `a`.
-        match (key.code, self.open.overlay.is_some()) {
+        // They work from both views — in the changes view they return to the file first.
+        match (key.code, self.open.overlay.is_some() || self.in_changes_view()) {
             (KeyCode::Char('a'), true) => return self.accept_changes(),
             (KeyCode::Char('D'), true) => return self.revert_changes(),
             _ => {}
@@ -179,6 +183,9 @@ impl App {
             (KeyCode::Esc, _) => {
                 if self.pending.is_some() || self.selection.is_some() {
                     self.clear_selection();
+                } else if self.in_changes_view() {
+                    // Esc in the changes view goes back to the file, before quit.
+                    self.toggle_changes_view()?;
                 } else {
                     self.request_quit();
                 }
@@ -199,7 +206,13 @@ impl App {
                 self.select_block(self.open.doc.blocks.len().saturating_sub(1));
             }
             (KeyCode::Char('c') | KeyCode::Enter, _) => {
-                // No selection: comment on the whole selected block.
+                // No selection: comment on the whole selected block. In the changes
+                // view that block is the whole-file hunk — commenting "the entire
+                // file" is never what was meant, so require a real selection there.
+                if self.in_changes_view() {
+                    self.status = Some("select the lines to comment: v + movement, then c".into());
+                    return Ok(());
+                }
                 if let (Some(block), Some(rendered)) =
                     (self.open.doc.blocks.get(self.selected), self.open.layout.blocks.get(self.selected))
                 {

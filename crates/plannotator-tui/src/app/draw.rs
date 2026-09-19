@@ -46,6 +46,16 @@ fn priority(kind: Kind) -> u8 {
 }
 
 impl App {
+    /// `+added −removed` for the footer chip: from the overlay when the file review is
+    /// showing, from the stashed counts while the changes view (which has no overlay)
+    /// is showing.
+    pub(super) fn change_counts(&self) -> Option<(usize, usize)> {
+        match &self.open.overlay {
+            Some(overlay) => Some((overlay.added_lines, overlay.removed_lines)),
+            None => self.changes_counts,
+        }
+    }
+
     pub(crate) fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let [header, body, footer] = Layout::vertical([
@@ -412,11 +422,8 @@ impl App {
         // The status leads: it is the transient half of the line, and the name and counters
         // it pushes right are on screen for the whole session anyway.
         let mut parts: Vec<String> = self.status.iter().cloned().collect();
-        if let Some(overlay) = &self.open.overlay {
-            parts.push(format!(
-                "+{} −{} changed since your review",
-                overlay.added_lines, overlay.removed_lines
-            ));
+        if let Some((added, removed)) = self.change_counts() {
+            parts.push(format!("+{added} −{removed} changed since your review"));
         }
         parts.extend([
             self.open.source.name.clone(),
@@ -440,6 +447,9 @@ impl App {
             _ if self.pending.is_some() => "a looks good · c comment · d delete · esc clear ",
             Focus::Tree => "j/k · enter open · E send · t hide · q quit ",
             Focus::Rail => "j/k · e edit · x remove · tab · q quit ",
+            Focus::Document if self.in_changes_view() => {
+                "v select · c comment · i back to file · E send · q quit "
+            }
             Focus::Document if self.open.overlay.is_some() => {
                 "c comment · a accept · D revert · i changes · E send · q quit "
             }

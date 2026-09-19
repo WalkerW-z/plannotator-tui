@@ -263,12 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn diff_lines_clip_instead_of_wrap() {
-        let long = "+".repeat(200);
+    fn diff_lines_wrap_so_no_text_is_lost() {
+        let long = format!("+{}", "word ".repeat(40));
         let patch = format!("@@ -1 +1 @@\n{long}\n");
         let doc = Document::parse_diff(patch);
         let layout = DocLayout::build(&doc, 80);
         let hunk = layout.blocks.first().expect("hunk");
-        assert_eq!(hunk.rows.len(), 2); // header + one clipped body row
+        assert!(hunk.rows.len() > 2, "a 200-char line wraps to several rows");
+        // Every wrapped row keeps the green style and maps back into the source.
+        assert!(
+            hunk.rows.iter().skip(1).all(|r| r.line.spans.iter().all(|s| s.style.fg == Some(Color::Green)))
+        );
+        let offsets: Vec<usize> = hunk.rows.iter().flat_map(|r| r.cells.iter().flatten().copied()).collect();
+        assert!(offsets.len() > 180, "wrapped rows still map to source bytes: {}", offsets.len());
     }
 }

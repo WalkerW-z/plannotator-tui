@@ -263,7 +263,14 @@ fn last_command(args: &[String]) -> Result<()> {
 }
 
 fn interactive(path: &PathBuf) -> Result<()> {
-    run_ui(|width| open_app(path, width, true))
+    run_ui(|width| {
+        let mut app = open_app(path, width, true)?;
+        // A changed file lands on its whole-file diff — the round-2 review — in
+        // interactive runs only. Headless commands (--export, --annotate, --snapshot)
+        // must keep seeing the real document and store, not the synthesized diff.
+        app.enter_changes_view_if_any();
+        Ok(app)
+    })
 }
 
 /// Own the terminal for one app: `build` gets the document width the screen allows.

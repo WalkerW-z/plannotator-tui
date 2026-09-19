@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::indexing_slicing, reason = "tests assert by panicking")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use plannotator_tui_schema::{DocumentSource, Kind, Provenance};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
@@ -408,4 +408,87 @@ fn a_diff_review_has_no_overlay_of_its_own() {
     .expect("opens");
     assert!(app.open.overlay.is_none());
     std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+// ----- v2: changes view (whole-file diff) ----------------------------------------
+
+mod overlay_view {
+    #![allow(clippy::expect_used, reason = "tests assert by panicking")]
+    use super::*;
+    use crate::overlay;
+
+    pub(crate) fn diff_app_with_baseline(tag: &str) -> (PathBuf, App) {
+        let (root, mut app, _) = file_app(tag);
+        app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
+        let Provenance::File { path } = &app.open.source.provenance else { unreachable!("file review") };
+        std::fs::write(path, "# Plan\n\none changed\n\ntwo\n\nthree\n\nfour added by the agent\n")
+            .expect("agent edit");
+        (root, app)
+    }
+
+    #[test]
+    fn headless_commands_still_see_the_real_document() {
+        // R1: the landing gate is interactive-only; headless paths must not land on
+        // the synthesized diff. `reopen` simulates a non-interactive open.
+        let (root, mut app) = diff_app_with_baseline("headless");
+        reopen(&mut app);
+        assert!(app.open.overlay.is_some(), "the overlay exists");
+        assert!(!app.in_changes_view(), "headless open keeps the real document");
+        let text = app.feedback();
+        assert!(text.contains("# Annotations on a.md"), "export reads the real file: {text}");
+        assert!(text.contains("(line 3)"), "real file line numbers, not diff offsets: {text}");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn toggling_to_changes_and_back_preserves_the_review() {
+        let (root, mut app) = diff_app_with_baseline("toggle");
+        reopen(&mut app);
+        app.enter_changes_view_if_any();
+        assert!(app.in_changes_view(), "landing view is the whole-file diff");
+        assert!(app.open.source.name.contains("changes"), "{}", app.open.source.name);
+        assert!(app.open.doc.source.contains("+one changed"), "diff text is the source");
+        assert!(app.open.doc.source.contains(" three\n"), "the unchanged tail is present");
+
+        app.handle_event(&Event::Key(KeyEvent::from(KeyCode::Esc))).expect("esc back");
+        assert!(!app.in_changes_view());
+        assert!(app.open.overlay.is_some(), "the file review kept its overlay");
+        assert_eq!(app.open.store.len(), 1, "round-1 annotation intact");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn accept_from_the_changes_view_writes_the_file_not_the_diff() {
+        let (root, mut app) = diff_app_with_baseline("accept");
+        reopen(&mut app);
+        app.enter_changes_view_if_any();
+        press(&mut app, 'a');
+
+        assert!(!app.in_changes_view(), "accept closes the changes view");
+        assert!(app.open.overlay.is_none());
+        let record = app.open.store.location_record().expect("record");
+        let baseline = overlay::read(record).expect("baseline");
+        assert!(
+            baseline.contains("one changed") && !baseline.contains('-'),
+            "baseline holds the FILE content: {baseline:?}"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn comments_in_the_changes_view_are_marked_for_quit_protection() {
+        let (root, mut app) = diff_app_with_baseline("quit");
+        reopen(&mut app);
+        app.enter_changes_view_if_any();
+        app.add_quote_annotation("+four added", Kind::Comment, "why here?".into()).expect("annotate");
+        assert!(!app.open.store.placed().is_empty(), "the comment exists in the transient store");
+        assert!(
+            app.in_changes_view() && !app.open.store.placed().is_empty(),
+            "the ConfirmQuit guard keys off placed() while the changes view is up"
+        );
+        // And the baseline is untouched by changes-view comments.
+        let record = app.open.store.location_record();
+        assert!(record.is_none(), "transient store has no record path");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 }

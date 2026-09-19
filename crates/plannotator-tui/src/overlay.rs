@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use similar::{DiffOp, TextDiff};
+use similar::{ChangeTag, DiffOp, TextDiff};
 
 /// Sidecar next to `annotations.json`: the content the reviewed round started from.
 pub(crate) fn baseline_path(record: &Path) -> PathBuf {
@@ -38,6 +38,11 @@ pub(crate) struct Overlay {
     pub(crate) removed: Vec<Range<usize>>,
     pub(crate) added_lines: usize,
     pub(crate) removed_lines: usize,
+    /// A unified diff covering the whole file — every baseline and current line, with
+    /// context lines prefixed ` `, removed `-`, added `+`. Rendered as the changes
+    /// view: the whole file with the diff inline. Built in the same pass as the
+    /// ranges, so opening a changed file diffs once, not twice.
+    pub(crate) full_diff: String,
 }
 
 impl Overlay {
@@ -71,7 +76,14 @@ impl Overlay {
                 }
             }
         }
-        Some(Self { baseline: baseline.to_owned(), added, removed, added_lines, removed_lines })
+        Some(Self {
+            baseline: baseline.to_owned(),
+            added,
+            removed,
+            added_lines,
+            removed_lines,
+            full_diff: full_context_diff(&diff),
+        })
     }
 
     /// Whether `offset` sits inside added content.
@@ -83,6 +95,38 @@ impl Overlay {
     pub(crate) fn is_removed(&self, offset: usize) -> bool {
         self.removed.iter().any(|r| r.contains(&offset))
     }
+}
+
+/// The whole-file unified diff for the changes view: every line of both versions in
+/// reading order — context prefixed ` `, removed `-`, added `+` — under one hunk
+/// header whose counts cover the file. Built from the same `TextDiff` the ranges
+/// came from, so opening a changed file diffs once.
+fn full_context_diff(diff: &TextDiff<'_, '_, str>) -> String {
+    let mut body = String::new();
+    let (mut old_total, mut new_total) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            // Context lines belong to both sides; the hunk counts say so.
+            ChangeTag::Equal => {
+                old_total += 1;
+                new_total += 1;
+            }
+            ChangeTag::Delete => old_total += 1,
+            ChangeTag::Insert => new_total += 1,
+        }
+        let prefix = match change.tag() {
+            ChangeTag::Equal => ' ',
+            ChangeTag::Delete => '-',
+            ChangeTag::Insert => '+',
+        };
+        body.push(prefix);
+        body.push_str(&change.to_string_lossy());
+        if change.missing_newline() {
+            body.push('\n');
+            body.push_str("\\ No newline at end of file\n");
+        }
+    }
+    format!("@@ -1,{old_total} +1,{new_total} @@\n{body}")
 }
 
 /// Byte range of current-source lines `from..to` (line indices into the `\n` split).
@@ -164,5 +208,22 @@ mod tests {
         let overlay = Overlay::between("a\nb\n", "a\nb\nc").expect("differs");
         let last = overlay.added.last().expect("added c");
         assert!(last.end <= 5, "range {last:?} must not run past 'a\\nb\\nc'");
+    }
+    #[test]
+    fn full_diff_covers_the_whole_file_with_inline_changes() {
+        let baseline = "# Title\n\nfirst\n\nkeep\n";
+        let current = "# Title\n\nfirst (expanded)\n\nkeep\n\nadded tail\n";
+        let overlay = Overlay::between(baseline, current).expect("differs");
+        let lines: Vec<&str> = overlay.full_diff.lines().collect();
+        assert_eq!(
+            lines.first().copied().expect("hunk header"),
+            "@@ -1,5 +1,7 @@",
+            "one hunk covers the file"
+        );
+        assert!(lines.contains(&"-first"), "removed line present");
+        assert!(lines.contains(&"+first (expanded)"), "added line present");
+        assert!(lines.contains(&"+added tail"), "added tail present");
+        assert!(lines.contains(&" # Title"), "context line present");
+        assert!(lines.contains(&" keep"), "unchanged tail present");
     }
 }

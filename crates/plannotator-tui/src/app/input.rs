@@ -69,6 +69,11 @@ impl App {
             (KeyCode::Char('F'), _) if self.is_file_review() => {
                 return self.run_review_action(ReviewAction::Finish);
             }
+            (KeyCode::Char('U'), _)
+                if self.focus == Focus::Document && self.overlay_active() && self.undo_archive.is_empty() =>
+            {
+                return self.unaccept_region_at_cursor();
+            }
             (KeyCode::Char('U'), _) if self.is_file_review() => {
                 return self.run_review_action(ReviewAction::Undo);
             }
@@ -174,9 +179,13 @@ impl App {
         }
         // Diff review verbs: only when no selection is pending, so the toolbar keeps `a`.
         // They work from both views — in the changes view they return to the file first.
-        match (key.code, self.open.overlay.is_some() || self.in_changes_view()) {
-            (KeyCode::Char('a'), true) => return self.accept_changes(),
-            (KeyCode::Char('D'), true) => return self.revert_changes(),
+        // `a`/`D` act on the block under the cursor; `A`/`X` on the whole file; `U` undoes
+        // an accept for the hovered block.
+        match (key.code, self.overlay_active()) {
+            (KeyCode::Char('a'), true) => return self.accept_region_at_cursor(),
+            (KeyCode::Char('A'), true) => return self.accept_all(),
+            (KeyCode::Char('D'), true) => return self.revert_region_at_cursor(),
+            (KeyCode::Char('X'), true) => return self.revert_all(),
             _ => {}
         }
         match (key.code, key.modifiers) {

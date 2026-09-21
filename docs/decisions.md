@@ -363,3 +363,43 @@ looked up in whichever table holds it. Verified against the `beta` source
 (`packages/core/src/session/sql.ts`, `packages/schema/src/session-message.ts`,
 `packages/util/src/global-roots.ts`) and a mixed-schema fixture reproducing the report.
 
+
+## 15. Review verbs act on the hovered block; accept is reversible (2026-09-21)
+
+The round-2 diff overlay first shipped three verbs: `a` accepted the whole file, `D` reverted
+it, `i` inspected it. Two problems surfaced in use: the accept key ignored the block under the
+cursor, and an accept could not be taken back.
+
+The verbs are now per region, with the block under the cursor as the unit:
+
+- `a` folds the hovered block's changed lines into the reference; other changed blocks keep
+  their marks.
+- `A` folds everything (the old `a`).
+- `D` puts the hovered block back to the reviewed text; `X` puts the whole file back (the old
+  `D`).
+- `U` un-accepts the hovered block: it shows as changed again.
+
+Reversibility needs the round's original content, so a second sidecar exists. `baseline.md`
+stays the reference the overlay marks against and moves forward on accept; `reviewed.md` is
+written with it at round start and is never touched by an accept. `U` restores a region in
+`baseline.md` from `reviewed.md`. Accepting everything makes the current file the reviewed
+version, so `reviewed.md` moves too and there is nothing to un-accept until the next round.
+
+The unit is the Markdown block, not the hunk or the line: the cursor already selects a block,
+and a block is what a reviewer reads as one sentence. A region verb pressed in the changes view
+returns to the file first and lands on the block the review last had selected (defaulting to the
+first changed block), because the whole-file diff is one synthesized hunk and carries no
+block structure of its own.
+
+## 16. A changed file opens on the file review (2026-09-21)
+
+The round-2 landing put a changed file straight into the whole-file diff of decision 15. In
+use that is the wrong place to start: the diff is one synthesized hunk with no Markdown block
+structure, so the region verbs cannot act in it, and a first `a` folds whichever block the
+program picks rather than one the reviewer chose.
+
+A changed file now opens on the file review — the marks and the `+N −M` chip — and `i` opens
+the whole-file diff on demand. The diff stays a read-only inspection view; the verbs stay on
+the file, where the block under the cursor is the reviewer's choice. Headless commands are
+unchanged: they always saw the real document. The `i` view itself still carries no blocks, so
+the verb-in-the-diff gap remains open.

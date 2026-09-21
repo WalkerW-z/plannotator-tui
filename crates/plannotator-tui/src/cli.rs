@@ -31,7 +31,7 @@ const USAGE: &str = "usage:
   plannotator-tui --blocks <file.md>
   plannotator-tui --annotate <file.md> <quote> <text> [comment|looks_good|delete]
   plannotator-tui --annotate-block <file.md> <block> <text>
-  plannotator-tui --snapshot <file.md> [cols rows scroll] [select-quote] [menu]
+  plannotator-tui --snapshot <file.md> [cols rows scroll] [select-quote] [menu] [keys=aA]
   plannotator-tui config
   plannotator-tui --version
   plannotator-tui herdr open [file.md | folder] [--placement overlay|split|popup] [--deliver-to <pane>]
@@ -128,10 +128,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             let cols: u16 = arg(2).and_then(|s| s.parse().ok()).unwrap_or(140);
             let rows: u16 = arg(3).and_then(|s| s.parse().ok()).unwrap_or(40);
             let scroll: i64 = arg(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-            // A trailing `menu` opens the Review menu; a quote may come before it.
-            let menu = args.get(5..).is_some_and(|rest| rest.last().is_some_and(|last| last == "menu"));
-            let select = arg(5).filter(|quote| *quote != "menu");
-            snapshot(&path(1)?, cols, rows, scroll, select, menu)
+            // A `menu` token opens the Review menu; `keys=…` feeds a key sequence. A bare
+            // positional token is the quote to select.
+            let rest = args.get(5..).unwrap_or_default();
+            let menu = rest.iter().any(|a| a == "menu");
+            let keys = rest.iter().find_map(|a| a.strip_prefix("keys="));
+            let select =
+                rest.iter().find(|a| a.as_str() != "menu" && !a.starts_with("keys=")).map(String::as_str);
+            snapshot(&path(1)?, cols, rows, scroll, select, menu, keys)
         }
         Some("--version" | "-V") => {
             println!("plannotator-tui {}", env!("CARGO_PKG_VERSION"));
@@ -263,14 +267,10 @@ fn last_command(args: &[String]) -> Result<()> {
 }
 
 fn interactive(path: &PathBuf) -> Result<()> {
-    run_ui(|width| {
-        let mut app = open_app(path, width, true)?;
-        // A changed file lands on its whole-file diff — the round-2 review — in
-        // interactive runs only. Headless commands (--export, --annotate, --snapshot)
-        // must keep seeing the real document and store, not the synthesized diff.
-        app.enter_changes_view_if_any();
-        Ok(app)
-    })
+    // A changed file opens on its file review: the marks and the `+N −M` chip are the
+    // review surface, and `i` opens the whole-file diff from there. Headless commands
+    // keep seeing the real document and store.
+    run_ui(|width| open_app(path, width, true))
 }
 
 /// Own the terminal for one app: `build` gets the document width the screen allows.
@@ -371,6 +371,7 @@ fn snapshot(
     scroll: i64,
     select: Option<&str>,
     menu: bool,
+    keys: Option<&str>,
 ) -> Result<()> {
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier};
@@ -383,6 +384,11 @@ fn snapshot(
     }
     if menu {
         app.open_review_menu();
+    }
+    if let Some(keys) = keys {
+        for key in snapshot_keys(keys)? {
+            app.handle_event(&event::Event::Key(key))?;
+        }
     }
     terminal.draw(|frame| app.draw(frame))?;
     let buffer = terminal.backend().buffer();
@@ -416,4 +422,42 @@ fn snapshot(
         }
     }
     Ok(())
+}
+
+/// Parse a `--snapshot` key sequence: printable characters are themselves, and `<esc>`,
+/// `<enter>`, `<tab>`, `<space>`, `<up>`/`<down>`/`<left>`/`<right>`,
+/// `<ctrl-u>`/`<ctrl-d>` name the rest. Each key is delivered through the real event
+/// handler, so a snapshot with `keys=` exercises the same path as a human at the keyboard.
+fn snapshot_keys(spec: &str) -> Result<Vec<event::KeyEvent>> {
+    use event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut keys = Vec::new();
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            keys.push(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            continue;
+        }
+        let mut name = String::new();
+        for inner in chars.by_ref() {
+            if inner == '>' {
+                break;
+            }
+            name.push(inner);
+        }
+        let (code, modifiers) = match name.to_ascii_lowercase().as_str() {
+            "esc" => (KeyCode::Esc, KeyModifiers::NONE),
+            "enter" | "cr" => (KeyCode::Enter, KeyModifiers::NONE),
+            "tab" => (KeyCode::Tab, KeyModifiers::NONE),
+            "space" => (KeyCode::Char(' '), KeyModifiers::NONE),
+            "up" => (KeyCode::Up, KeyModifiers::NONE),
+            "down" => (KeyCode::Down, KeyModifiers::NONE),
+            "left" => (KeyCode::Left, KeyModifiers::NONE),
+            "right" => (KeyCode::Right, KeyModifiers::NONE),
+            "ctrl-u" => (KeyCode::Char('u'), KeyModifiers::CONTROL),
+            "ctrl-d" => (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            other => anyhow::bail!("unknown snapshot key <{other}>"),
+        };
+        keys.push(KeyEvent::new(code, modifiers));
+    }
+    Ok(keys)
 }

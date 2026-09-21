@@ -152,6 +152,10 @@ pub(crate) struct App {
     /// `+added −removed` of the stashed review, for the footer chip while the changes
     /// view (whose own Open has no overlay) is showing.
     changes_counts: Option<(usize, usize)>,
+    /// The file review's block and scroll while the changes view is on screen, so `i`
+    /// returns to where the review was instead of the top of the file.
+    file_selected: usize,
+    file_scroll: usize,
     /// Where annotations are stored and how this folder is named there.
     data_dir: PathBuf,
     project: String,
@@ -265,6 +269,8 @@ impl App {
             pick_cache: HashMap::new(),
             changes_open: None,
             changes_counts: None,
+            file_selected: 0,
+            file_scroll: 0,
             message_host: String::new(),
             message_transcript: String::new(),
             message_session: None,
@@ -406,6 +412,9 @@ impl App {
         }
         if let Some(record) = self.open.store.location_record() {
             let _ = overlay::write(record, &self.open.doc.source);
+            // A fresh round makes the current content the reviewed version too, so a
+            // region accept later can be un-accepted back to it.
+            let _ = overlay::write_reviewed(record, &self.open.doc.source);
         }
     }
 
@@ -424,15 +433,6 @@ impl App {
         self.changes_open.is_some()
     }
 
-    /// Land in the changes view when the file changed since review. Interactive single-
-    /// file opens only (called from `interactive`); headless commands and folder mode
-    /// keep the real document as `self.open`.
-    pub(crate) fn enter_changes_view_if_any(&mut self) {
-        if self.tree.is_none() && self.open.overlay.is_some() && !self.in_changes_view() {
-            let _ = self.toggle_changes_view();
-        }
-    }
-
     /// `i`: swap the file review for the whole-file diff, or back. The stash keeps the
     /// review intact — annotations on it live on disk, the swap is purely visual.
     fn toggle_changes_view(&mut self) -> Result<()> {
@@ -440,6 +440,11 @@ impl App {
             self.changes_counts = None;
             self.open = md;
             self.swap_open_reset();
+            // Return to the block and offset the review was left at, so a region verb
+            // pressed after inspecting the diff acts on the block the user picked.
+            self.selected = self.file_selected.min(self.open.doc.blocks.len().saturating_sub(1));
+            self.scroll = self.file_scroll.min(self.open.layout.total_rows.saturating_sub(1));
+            self.ensure_selected_visible();
             self.status = Some("file review".into());
             return Ok(());
         }
@@ -460,7 +465,19 @@ impl App {
         let width = self.open.layout.width;
         let changes = Open::new(source, width, &self.data_dir, &self.project)?;
         let md = std::mem::replace(&mut self.open, changes);
+        // A region verb from the diff acts on the file's block: keep the block the user
+        // picked, or default to the first changed block when the cursor has none.
+        let picked = self.selected;
+        let target = md.overlay.as_ref().and_then(|ov| {
+            if md.doc.blocks.get(picked).is_some_and(|b| ov.touches(&b.range)) {
+                Some(picked)
+            } else {
+                md.doc.blocks.iter().position(|b| ov.touches(&b.range))
+            }
+        });
         self.changes_open = Some(md);
+        self.file_selected = target.unwrap_or(picked);
+        self.file_scroll = self.scroll;
         self.swap_open_reset();
         self.changes_counts = Some(counts);
         self.status = Some(format!("whole-file diff · +{} −{} · i back to file", counts.0, counts.1));
@@ -493,9 +510,38 @@ impl App {
         self.derive_send_state();
     }
 
-    /// `a`: the changes are fine. From the changes view, return to the file first —
-    /// the verbs operate on the review, never on the transient diff document.
-    fn accept_changes(&mut self) -> Result<()> {
+    /// `a`: fold the hovered block's changed lines into the baseline. Other changed
+    /// blocks keep their marks. From the changes view, return to the file first — the
+    /// verbs operate on the review, never on the transient diff document.
+    fn accept_region_at_cursor(&mut self) -> Result<()> {
+        if self.in_changes_view() {
+            self.toggle_changes_view()?;
+        }
+        let Some(block) = self.hovered_block() else {
+            self.status = Some("no block under the cursor".into());
+            return Ok(());
+        };
+        let Some(overlay) = self.open.overlay.as_ref() else {
+            self.status = Some("nothing to accept: the file matches your last review".into());
+            return Ok(());
+        };
+        let updated = overlay::accept_region(&overlay.baseline, &self.open.doc.source, &block);
+        if updated == overlay.baseline {
+            self.status = Some("no changes in this block to accept".into());
+            return Ok(());
+        }
+        let Some(record) = self.open.store.location_record().map(Path::to_path_buf) else {
+            self.status = Some("nothing to accept: annotations are not persisted".into());
+            return Ok(());
+        };
+        overlay::write(&record, &updated)?;
+        self.reload()?;
+        self.status = Some("accepted this block · other changes still marked".into());
+        Ok(())
+    }
+
+    /// `A`: the whole file is fine. Fold everything into the baseline so no marks remain.
+    fn accept_all(&mut self) -> Result<()> {
         if self.in_changes_view() {
             self.toggle_changes_view()?;
         }
@@ -505,16 +551,47 @@ impl App {
         }
         if let Some(record) = self.open.store.location_record() {
             overlay::write(record, &self.open.doc.source)?;
+            // Accepting everything makes the current file the reviewed version, so
+            // un-accept has nothing to go back to until the next round.
+            overlay::write_reviewed(record, &self.open.doc.source)?;
         }
         self.open.overlay = None;
-        self.status = Some("changes accepted · baseline updated".into());
+        self.status = Some("all changes accepted · baseline updated".into());
         Ok(())
     }
 
-    /// `D`: put the file back to the version under review and re-read it. Annotations
-    /// were made against exactly that content, so they re-anchor cleanly. From the
+    /// `D`: put the hovered block back to the reviewed version and re-read. From the
     /// changes view, return to the file first — revert is a review verb.
-    fn revert_changes(&mut self) -> Result<()> {
+    fn revert_region_at_cursor(&mut self) -> Result<()> {
+        if self.in_changes_view() {
+            self.toggle_changes_view()?;
+        }
+        let Some(block) = self.hovered_block() else {
+            self.status = Some("no block under the cursor".into());
+            return Ok(());
+        };
+        let Some(overlay) = self.open.overlay.as_ref() else {
+            self.status = Some("nothing to revert: the file matches your last review".into());
+            return Ok(());
+        };
+        let Provenance::File { path } = &self.open.source.provenance else {
+            return Ok(());
+        };
+        let path = path.clone();
+        let reverted = overlay::revert_region(&overlay.baseline, &self.open.doc.source, &block);
+        if reverted == self.open.doc.source {
+            self.status = Some("no changes in this block to revert".into());
+            return Ok(());
+        }
+        std::fs::write(&path, reverted).with_context(|| format!("reverting {}", path.display()))?;
+        self.reload()?;
+        self.status = Some("reverted this block to the version you reviewed".into());
+        Ok(())
+    }
+
+    /// `X`: put the whole file back to the reviewed version and re-read it. Annotations
+    /// were made against exactly that content, so they re-anchor cleanly.
+    fn revert_all(&mut self) -> Result<()> {
         if self.in_changes_view() {
             self.toggle_changes_view()?;
         }
@@ -531,6 +608,50 @@ impl App {
         self.reload()?;
         self.status = Some("reverted to the version you reviewed".into());
         Ok(())
+    }
+
+    /// `U`: put the reviewed text back into the baseline for the hovered block, so a
+    /// block that was accepted shows as changed again. The round's original content
+    /// lives in `reviewed.md`, untouched by region accepts.
+    fn unaccept_region_at_cursor(&mut self) -> Result<()> {
+        if self.in_changes_view() {
+            self.toggle_changes_view()?;
+        }
+        let Some(block) = self.hovered_block() else {
+            self.status = Some("no block under the cursor".into());
+            return Ok(());
+        };
+        let Some(overlay) = self.open.overlay.as_ref() else {
+            self.status = Some("nothing to un-accept: the file matches your last review".into());
+            return Ok(());
+        };
+        let Some(record) = self.open.store.location_record().map(Path::to_path_buf) else {
+            return Ok(());
+        };
+        let Some(reviewed) = overlay::read_reviewed(&record) else {
+            self.status = Some("nothing to un-accept: no reviewed version recorded".into());
+            return Ok(());
+        };
+        let restored = overlay::restore_region(&reviewed, &overlay.baseline, &self.open.doc.source, &block);
+        if restored == overlay.baseline {
+            self.status = Some("nothing accepted in this block".into());
+            return Ok(());
+        }
+        overlay::write(&record, &restored)?;
+        self.reload()?;
+        self.status = Some("un-accepted this block · it shows as changed again".into());
+        Ok(())
+    }
+
+    /// The byte range of the block under the cursor, if any.
+    fn hovered_block(&self) -> Option<Range<usize>> {
+        self.open.doc.blocks.get(self.selected).map(|b| b.range.clone())
+    }
+
+    /// Whether the diff review verbs are live: an overlay on the file, or its changes
+    /// view on screen (the overlay is stashed while that view is up).
+    fn overlay_active(&self) -> bool {
+        self.open.overlay.is_some() || self.in_changes_view()
     }
 
     /// Apply a toolbar action to the pending selection.

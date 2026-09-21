@@ -329,7 +329,7 @@ fn reopening_an_agent_edited_file_shows_the_overlay() {
 }
 
 #[test]
-fn accepting_changes_updates_the_baseline_and_clears_the_marks() {
+fn accepting_all_changes_updates_the_baseline_and_clears_the_marks() {
     let (root, mut app, _) = file_app("overlay-accept");
     app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
 
@@ -339,7 +339,7 @@ fn accepting_changes_updates_the_baseline_and_clears_the_marks() {
     reopen(&mut app);
     assert!(app.open.overlay.is_some());
 
-    press(&mut app, 'a');
+    press(&mut app, 'A');
     assert!(app.open.overlay.is_none(), "the diff UI disappears");
     let record = app.open.store.location_record().expect("persisted store");
     let baseline = overlay::read(record).expect("baseline");
@@ -352,7 +352,7 @@ fn accepting_changes_updates_the_baseline_and_clears_the_marks() {
 }
 
 #[test]
-fn reverting_puts_the_reviewed_version_back_on_disk() {
+fn reverting_all_puts_the_reviewed_version_back_on_disk() {
     let (root, mut app, _) = file_app("overlay-revert");
     app.add_quote_annotation("one", Kind::Comment, "round 1 note".into()).expect("annotate");
 
@@ -362,7 +362,7 @@ fn reverting_puts_the_reviewed_version_back_on_disk() {
     reopen(&mut app);
     assert!(app.open.overlay.is_some());
 
-    press(&mut app, 'D');
+    press(&mut app, 'X');
     assert_eq!(
         std::fs::read_to_string(&path).expect("reverted"),
         "# Plan\n\none\n\ntwo\n\nthree\n",
@@ -428,8 +428,8 @@ mod overlay_view {
 
     #[test]
     fn headless_commands_still_see_the_real_document() {
-        // R1: the landing gate is interactive-only; headless paths must not land on
-        // the synthesized diff. `reopen` simulates a non-interactive open.
+        // Headless paths must never land on the synthesized diff. `reopen` simulates a
+        // non-interactive open.
         let (root, mut app) = diff_app_with_baseline("headless");
         reopen(&mut app);
         assert!(app.open.overlay.is_some(), "the overlay exists");
@@ -444,8 +444,8 @@ mod overlay_view {
     fn toggling_to_changes_and_back_preserves_the_review() {
         let (root, mut app) = diff_app_with_baseline("toggle");
         reopen(&mut app);
-        app.enter_changes_view_if_any();
-        assert!(app.in_changes_view(), "landing view is the whole-file diff");
+        app.toggle_changes_view().expect("changes view");
+        assert!(app.in_changes_view(), "the toggle opens the whole-file diff");
         assert!(app.open.source.name.contains("changes"), "{}", app.open.source.name);
         assert!(app.open.doc.source.contains("+one changed"), "diff text is the source");
         assert!(app.open.doc.source.contains(" three\n"), "the unchanged tail is present");
@@ -461,8 +461,8 @@ mod overlay_view {
     fn accept_from_the_changes_view_writes_the_file_not_the_diff() {
         let (root, mut app) = diff_app_with_baseline("accept");
         reopen(&mut app);
-        app.enter_changes_view_if_any();
-        press(&mut app, 'a');
+        app.toggle_changes_view().expect("changes view");
+        press(&mut app, 'A');
 
         assert!(!app.in_changes_view(), "accept closes the changes view");
         assert!(app.open.overlay.is_none());
@@ -479,7 +479,7 @@ mod overlay_view {
     fn comments_in_the_changes_view_are_marked_for_quit_protection() {
         let (root, mut app) = diff_app_with_baseline("quit");
         reopen(&mut app);
-        app.enter_changes_view_if_any();
+        app.toggle_changes_view().expect("changes view");
         app.add_quote_annotation("+four added", Kind::Comment, "why here?".into()).expect("annotate");
         assert!(!app.open.store.placed().is_empty(), "the comment exists in the transient store");
         assert!(
@@ -489,6 +489,95 @@ mod overlay_view {
         // And the baseline is untouched by changes-view comments.
         let record = app.open.store.location_record();
         assert!(record.is_none(), "transient store has no record path");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Block index whose text contains `quote`.
+    fn block_with(app: &App, quote: &str) -> usize {
+        (0..app.open.doc.blocks.len())
+            .find(|&i| app.open.doc.block_text(i).contains(quote))
+            .expect("the block holding the quote")
+    }
+
+    #[test]
+    fn accepting_the_hovered_block_leaves_the_other_change_marked() {
+        let (root, mut app) = diff_app_with_baseline("accept-block");
+        reopen(&mut app);
+        app.selected = block_with(&app, "one changed");
+        press(&mut app, 'a');
+
+        let ov = app.open.overlay.as_ref().expect("the tail is still a change");
+        let tail = app.open.doc.source.find("four added").expect("present");
+        assert!(ov.is_added(tail), "the untouched block keeps its mark");
+        assert!(
+            !ov.is_added(app.open.doc.source.find("one changed").expect("present")),
+            "the hovered block no longer shows as changed"
+        );
+        let baseline = overlay::read(app.open.store.location_record().expect("record")).expect("baseline");
+        assert!(baseline.contains("one changed"), "the hovered block folded into the baseline");
+        assert!(!baseline.contains("four added"), "the other change did not fold");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reverting_the_hovered_block_restores_only_that_block() {
+        let (root, mut app) = diff_app_with_baseline("revert-block");
+        reopen(&mut app);
+        let Provenance::File { path } = &app.open.source.provenance else { return };
+        let path = path.clone();
+        app.selected = block_with(&app, "one changed");
+        press(&mut app, 'D');
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file"),
+            "# Plan\n\none\n\ntwo\n\nthree\n\nfour added by the agent\n",
+            "only the hovered block went back to the reviewed text"
+        );
+        let ov = app.open.overlay.as_ref().expect("the tail is still a change");
+        assert!(ov.is_added(app.open.doc.source.find("four added").expect("present")));
+        assert!(!app.open.doc.source.contains("one changed"), "the reverted block is gone");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn un_accepting_the_hovered_block_marks_it_changed_again() {
+        let (root, mut app) = diff_app_with_baseline("unaccept");
+        reopen(&mut app);
+        app.selected = block_with(&app, "one changed");
+        press(&mut app, 'a');
+        assert!(
+            !app.open
+                .overlay
+                .as_ref()
+                .expect("tail remains")
+                .is_added(app.open.doc.source.find("one changed").expect("present")),
+            "the block was accepted"
+        );
+
+        // The cursor stayed on the same block; un-accept puts the reviewed text back.
+        press(&mut app, 'U');
+        let ov = app.open.overlay.as_ref().expect("still a diff");
+        assert!(
+            ov.is_added(app.open.doc.source.find("one changed").expect("present")),
+            "the un-accepted block shows as changed again"
+        );
+        let baseline = overlay::read(app.open.store.location_record().expect("record")).expect("baseline");
+        assert!(baseline.contains("\none\n") && !baseline.contains("one changed"));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_region_verb_from_the_changes_view_lands_on_the_file() {
+        let (root, mut app) = diff_app_with_baseline("changes-verb");
+        reopen(&mut app);
+        app.toggle_changes_view().expect("changes view");
+        assert!(app.in_changes_view());
+        press(&mut app, 'a');
+
+        assert!(!app.in_changes_view(), "the verb returns to the file review");
+        let baseline = overlay::read(app.open.store.location_record().expect("record")).expect("baseline");
+        assert!(baseline.contains("one changed"), "the first changed block folded");
+        assert!(!baseline.contains("four added"), "the other change did not");
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -451,7 +451,7 @@ impl App {
                 "v select · c comment · i back to file · E send · q quit "
             }
             Focus::Document if self.open.overlay.is_some() => {
-                "c comment · a accept · D revert · i changes · E send · q quit "
+                "c comment · a/A accept · D/X revert · U un-accept · i changes · E send "
             }
             Focus::Document => "drag or v select · c comment · E send · tab · q quit ",
         };
